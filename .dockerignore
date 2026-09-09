@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/
+dist/
+document/
+*.log
+*.wav
+*.spec
+config.json
+state.json
+ecliptica_overlay.py
