@@ -39,6 +39,10 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 STATE_PATH = os.path.join(SCRIPT_DIR, "state.json")
 APP_LOG_PATH = os.path.join(SCRIPT_DIR, "app.log")
 WARNING_SOUND_WAV_PATH = os.path.join(SCRIPT_DIR, "警告音.wav")
+TOKEN_SOUND_WAV_PATH = os.path.join(SCRIPT_DIR, "トークン警告音.wav")
+# wavが無い場合に鳴らす生成音。狙われた時とトークンで高さを変えて聞き分けられるようにする
+TARGET_BEEP_HZ = 880
+TOKEN_BEEP_HZ = 523
 
 DEFAULT_CONFIG = {
     "log_dir": os.path.join(os.environ["USERPROFILE"], "AppData", "LocalLow", "VRChat", "VRChat"),
@@ -54,6 +58,7 @@ DEFAULT_CONFIG = {
     "window_opacity_percent": 90,
     "target_warning_sound_enabled": False,
     "target_warning_sound_volume_percent": 80,
+    "token_warning_enabled": True,
 }
 
 
@@ -135,6 +140,12 @@ BOSS_DEFEATED_RE = re.compile(r"Tracking boss as defeated in-run\.")
 LOBBY_RE = re.compile(r"ECLIPTICA - now in lobby")
 INTERMISSION_RE = re.compile(r"ECLIPTICA - now in intermission")
 SESSION_ID_RE = re.compile(r"ECLIPTICA (?:MASTER Setting|saving|loaded) SESSION ID(?: to)? (\d+)")
+
+# トークンはステージ移行の直前に湧いた数だけ行が出る（通常3行）。
+# 拾うたびにワールドがセッションを保存するので、その保存回数が取得数になる。
+# ただしボス戦への突入時にも保存が走るため、探索中の分から1件差し引く。
+TOKEN_SPAWN_RE = re.compile(r"spawn token,")
+TOKEN_PICKUP_RE = re.compile(r"ECLIPTICA saving SESSION ID")
 # ボス撃破時、ゲーム自身が出す「本当にそのボスに与えた合計ダメージ」の答え合わせ用
 BOSS_DEAD_RE = re.compile(r"Boss \S+ dead, personal damage dealt:")
 STRIKE_DMG_RE = re.compile(r"(?<!NON-)STRIKE DMG: (\d+)")
@@ -161,6 +172,7 @@ CLASS_INFO = {
 
 POLL_MS = 300  # ログファイルを読みに行く間隔
 UPDATE_MS = 200  # 表示を更新する間隔
+TOKEN_WARNING_DELAY_MS = 1000  # ボス撃破の演出と重ならないよう、警告を少し遅らせる
 
 
 def load_config():
@@ -262,6 +274,13 @@ class SettingsDialog(tk.Toplevel):
         ).grid(row=row, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
         row += 1
 
+        self.token_warning_var = tk.BooleanVar(value=bool(config["token_warning_enabled"]))
+        tk.Checkbutton(
+            self, text="トークンを取り逃したままボス戦に入ったら警告音を鳴らす",
+            variable=self.token_warning_var,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+        row += 1
+
         tk.Label(self, text="警告音の音量（0〜100）").grid(
             row=row, column=0, sticky="w", padx=6, pady=(0, 2), columnspan=2
         )
@@ -309,6 +328,7 @@ class SettingsDialog(tk.Toplevel):
         self.config_data["party_share_enabled"] = self.party_share_var.get()
         self.config_data["target_warning_sound_enabled"] = self.target_warning_sound_var.get()
         self.config_data["target_warning_sound_volume_percent"] = self.target_warning_sound_volume_var.get()
+        self.config_data["token_warning_enabled"] = self.token_warning_var.get()
         save_config(self.config_data)
         self.on_save(self.config_data)
         self.destroy()
@@ -320,7 +340,7 @@ DPS_WINDOW_SECONDS = 10  # DPS/DTPSは「戦闘全体の平均」ではなく直
 class StageSegment:
     """1つのステージ（または休憩所）に滞在している間の集計。"""
 
-    def __init__(self, name, phase, class_name, start_time):
+    def __init__(self, name, phase, class_name, start_time, token_total=0):
         self.name = name
         self.phase = phase
         self.class_name = class_name
@@ -334,8 +354,54 @@ class StageSegment:
         self.boss_defeated = False
         self.outcome = None  # "cleared" / "defeated" / None
         self.official_boss_damage = 0  # ゲーム自身が報告するボス単体への合計ダメージ（答え合わせ用）
+        self.token_total = token_total  # このステージに湧いたトークンの数
+        self.token_saves = 0  # 探索中のセッション保存回数（＝取得数＋ボス突入分）
+        self.token_boss_saves = 0  # ボス戦開始後の保存回数（戦闘中に拾った分＋終了時の分）
+        self.token_collected = None  # ボス戦突入時に確定する取得数
+        self.token_finalized = False
         self.recent_hits = deque()  # (timestamp, amount) 直近DPS計算用
         self.recent_taken = deque()  # (timestamp, amount) 直近DTPS計算用
+
+    def settle_tokens(self):
+        """ボス戦突入時点の取得数を確定する。警告を出すかの判断に使う。
+
+        突入時の保存1件は取得ではないので除く。既に確定済みなら何もしない
+        （ボスは第2形態などで複数回ログに出るため）。
+        """
+        if self.token_collected is None:
+            self.token_collected = max(0, self.token_saves - 1)
+
+    def finalize_tokens(self, ending):
+        """ステージ終了時に、ボス戦中に拾った分を足し込む。
+
+        トークンは戦闘中でも回収できる。ただし休憩突入時に2件、ラン終了時に
+        1件、取得とは無関係な保存が走るのでその分を除く。
+        """
+        if self.token_finalized:
+            return
+        base = self.token_saves if self.token_collected is None else self.token_collected
+        overhead = {"intermission": 2, "lobby": 1}.get(ending, 0)
+        self.token_collected = base + max(0, self.token_boss_saves - overhead)
+        self.token_finalized = True
+
+    @property
+    def tokens_collected_now(self):
+        """今の時点で拾えている数。ボス戦中の分も含む。"""
+        if self.token_collected is None:
+            return self.token_saves
+        if self.token_finalized:
+            return self.token_collected
+        return self.token_collected + self.token_boss_saves
+
+    @property
+    def tokens_missing(self):
+        return bool(self.token_total) and self.tokens_collected_now < self.token_total
+
+    @property
+    def token_text(self):
+        if not self.token_total:
+            return ""
+        return f"{self.tokens_collected_now}/{self.token_total}"
 
     @property
     def display_name(self):
@@ -626,14 +692,11 @@ class DPSOverlay:
         self.in_lobby = False
         self.current_boss_target = None  # 現在ボスのownershipを持っている（＝狙われている）プレイヤー名
         self._pending_strike_dmg = None
+        self._pending_token_spawns = 0  # 次のステージに湧いたトークン数の受け皿
         self.party_members = []
 
-        self._warning_wav = None
-        if os.path.exists(WARNING_SOUND_WAV_PATH):
-            try:
-                self._warning_wav = _load_wav_samples(WARNING_SOUND_WAV_PATH)
-            except (wave.Error, EOFError):
-                pass
+        self._warning_wav = self._load_optional_wav(WARNING_SOUND_WAV_PATH)
+        self._token_wav = self._load_optional_wav(TOKEN_SOUND_WAV_PATH)
 
         self._switch_log_if_needed()
         self._restore_state_if_matching()
@@ -645,13 +708,22 @@ class DPSOverlay:
         self._network_thread = threading.Thread(target=self._network_worker, daemon=True)
         self._network_thread.start()
 
-    def _play_target_warning_sound(self):
+    @staticmethod
+    def _load_optional_wav(path):
+        """音源があれば読む。無くても生成音で代替できるので失敗は無視する。"""
+        if not os.path.exists(path):
+            return None
+        try:
+            return _load_wav_samples(path)
+        except (wave.Error, EOFError, OSError):
+            return None
+
+    def _play_warning_sound(self, wav=None, freq=TARGET_BEEP_HZ):
         volume_percent = self.config.get("target_warning_sound_volume_percent", 80)
-        if self._warning_wav is not None:
-            n_channels, sampwidth, framerate, frames = self._warning_wav
-            wav_bytes = _scale_wav_volume(n_channels, sampwidth, framerate, frames, volume_percent)
+        if wav is not None:
+            wav_bytes = _scale_wav_volume(*wav, volume_percent)
         else:
-            wav_bytes = _build_warning_beep_wav(volume_percent)
+            wav_bytes = _build_warning_beep_wav(volume_percent, freq=freq)
         # winsoundはSND_MEMORYとSND_ASYNCの併用を許さない（RuntimeErrorになる）。
         # かといって同期再生をそのまま呼ぶとUIスレッドが音の長さだけ止まるので、
         # 別スレッドで同期再生する。バッファは引数として渡し、再生中は参照が残る。
@@ -835,17 +907,36 @@ class DPSOverlay:
             if self.current_stage and not self.current_stage.boss_defeated:
                 self.current_stage.add_taken(amount, now)
             return
+        if TOKEN_SPAWN_RE.search(line):
+            # ステージ移行の直前に出るので、次のステージの持ち分として貯めておく
+            self._pending_token_spawns += 1
+            return
         m = STAGE_RE.search(line)
         if m:
+            if self.current_stage:
+                self.current_stage.finalize_tokens("stage")
             self._end_current_stage(now)
             name, phase, class_name = m.group(1).strip(), float(m.group(2)), m.group(3)
-            self.current_stage = StageSegment(name, phase, class_name, now)
+            self.current_stage = StageSegment(
+                name, phase, class_name, now, token_total=self._pending_token_spawns
+            )
+            self._pending_token_spawns = 0
             self.in_lobby = False
             self.current_boss_target = None
+            return
+        if TOKEN_PICKUP_RE.search(line):
+            # 探索中とボス戦中で扱いが違うので分けて数える
+            if self.current_stage:
+                if self.current_stage.token_collected is None:
+                    self.current_stage.token_saves += 1
+                else:
+                    self.current_stage.token_boss_saves += 1
             return
         m = BOSS_RE.search(line)
         if m:
             if self.current_stage:
+                # ここから先の保存は探索中とは扱いが変わるので区切っておく
+                self.current_stage.settle_tokens()
                 self.current_stage.boss_name = m.group(1).strip()
                 self.current_stage.boss_defeated = False
                 self.current_stage.last_event_time = now
@@ -856,8 +947,11 @@ class DPSOverlay:
             if self.current_stage and self.current_stage.boss_name and not self.current_stage.boss_defeated:
                 self.current_stage.boss_defeated = True
                 self.current_stage.last_event_time = now
+                self._notify_missed_tokens(self.current_stage)
             return
         if LOBBY_RE.search(line):
+            if self.current_stage:
+                self.current_stage.finalize_tokens("lobby")
             self._end_current_stage(now, run_ended=True)
             self.in_lobby = True
             self.current_boss_target = None
@@ -865,6 +959,8 @@ class DPSOverlay:
         if INTERMISSION_RE.search(line):
             # ボス撃破後の小休止に入った時点でHISTORYを確定させる
             # （次のステージ読み込みまで待たない）
+            if self.current_stage:
+                self.current_stage.finalize_tokens("intermission")
             self._end_current_stage(now)
             self.current_boss_target = None
             return
@@ -885,7 +981,7 @@ class DPSOverlay:
                 self.current_boss_target = new_owner
                 is_targeted = self.current_boss_target == self.player_name
                 if is_targeted and not was_targeted and self.config.get("target_warning_sound_enabled"):
-                    self._play_target_warning_sound()
+                    self._play_warning_sound(self._warning_wav, TARGET_BEEP_HZ)
             return
         m = SESSION_ID_RE.search(line)
         if m:
@@ -924,16 +1020,35 @@ class DPSOverlay:
         self.current_stage = None
         save_state(self.session_id, self.stage_history)
 
+    def _notify_missed_tokens(self, stage):
+        """ボス撃破時に取り逃しがあれば知らせる。ゲートへ移動するまでの間に拾えるため。
+
+        この時点なら戦闘中に拾った分は反映済みで、休憩突入時の保存はまだ
+        来ていないので、補正なしでそのまま数えられる。
+        """
+        if not self.config.get("token_warning_enabled"):
+            return
+        self.root.after(TOKEN_WARNING_DELAY_MS, lambda: self._warn_if_tokens_missing(stage))
+
+    def _warn_if_tokens_missing(self, stage):
+        # 遅らせている間に拾っているかもしれないので、鳴らす直前に数え直す
+        if stage.tokens_missing:
+            self._play_warning_sound(self._token_wav, TOKEN_BEEP_HZ)
+
     def _describe_stage_status(self, stage, now):
         if stage.is_hub:
             return f"休憩所  {format_duration(stage.duration(now))}"
+        token = f"  🪙{stage.token_text}" if stage.token_text else ""
         if stage.boss_name and not stage.boss_defeated:
-            return f"ボス戦: {stage.boss_name}  {format_duration(stage.duration(now))}"
+            return f"ボス戦: {stage.boss_name}  {format_duration(stage.duration(now))}{token}"
         if stage.boss_defeated:
-            return f"ボス撃破  {format_duration(stage.duration(now))}"
-        return f"探索中  {format_duration(stage.duration(now))}"
+            # 撃破後はゲートへ移動するまでが回収の猶予。取り逃しをここで目立たせる
+            if stage.tokens_missing:
+                return f"⚠ トークン未回収 {stage.token_text}  ゲートへ行く前に回収"
+            return f"ボス撃破  {format_duration(stage.duration(now))}{token}"
+        return f"探索中  {format_duration(stage.duration(now))}{token}"
 
-    HISTORY_COL_WIDTHS = {"rank": 3, "name": 12, "duration": 6, "dps": 8, "damage": 14}
+    HISTORY_COL_WIDTHS = {"rank": 3, "name": 12, "duration": 6, "token": 5, "dps": 8, "damage": 14}
     HISTORY_COL_ANCHOR = {"damage": "e", "dps": "e"}
     PARTY_COL_WIDTHS = {"rank": 3, "name": 11, "class": 5, "dps": 7, "total": 16}
     PARTY_COL_ANCHOR = {"dps": "e", "total": "e"}
@@ -1016,6 +1131,10 @@ class DPSOverlay:
             if stage.official_boss_damage:
                 damage_text += f"({stage.official_boss_damage})"
             row["damage"].config(text=damage_text, fg=color)
+            token_color = color
+            if stage.token_total and (stage.token_collected or 0) < stage.token_total:
+                token_color = "#ff6b6b"  # 取り逃したステージは赤で目立たせる
+            row["token"].config(text=stage.token_text, fg=token_color)
             row["dps"].config(text=f"{stage.final_dps():.0f}dps", fg=color)
             for w in row.values():
                 w.grid()

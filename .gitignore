@@ -9,3 +9,4 @@ app.log
 server.log
 cloudflared.log
 document/
+*.mp3
