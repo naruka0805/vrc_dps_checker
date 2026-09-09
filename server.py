@@ -11,6 +11,7 @@
     (デフォルトで http://0.0.0.0:8000 で待ち受ける。PORT環境変数で変更可)
 """
 
+import json
 import os
 import threading
 import time
@@ -160,6 +161,7 @@ def report(r: Report):
         existing = room.get(r.player_name)
         if existing is None and len(room) >= MAX_MEMBERS_PER_ROOM:
             raise HTTPException(status_code=503, detail="instance is full")
+        joined = existing is None
 
         # 既にいるメンバーなら、DPSの上下に関係なく最初に参加した時刻を保持し続ける
         # （クライアントの「No順」表示を、DPS変動で毎回入れ替わらない安定した順序にするため）
@@ -172,6 +174,17 @@ def report(r: Report):
             "last_seen": now,
             "first_seen": first_seen,
         }
+
+    # 利用状況の集計用。毎リクエストではなく参加した瞬間だけ記録する
+    # (Cloud Runは標準出力のJSONを構造化ログとして取り込む)
+    if joined:
+        print(json.dumps({
+            "severity": "INFO",
+            "event": "player_joined",
+            "instance_id": r.instance_id,
+            "player_name": r.player_name,
+            "class_name": r.class_name,
+        }, ensure_ascii=False), flush=True)
     return {"ok": True}
 
 
