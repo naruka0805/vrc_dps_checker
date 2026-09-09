@@ -47,7 +47,7 @@ DEFAULT_CONFIG = {
     "taken_pattern": r"damage has been taken: (\d+), from source: (\S+)",
     "history_size": 15,
     "party_share_enabled": False,
-    "backend_url": "http://localhost:8000",
+    "backend_url": "https://ecliptica-party-285197394334.asia-northeast1.run.app",
     "report_interval_seconds": 3,
     "party_sort_mode": "no",
     "history_collapsed": False,

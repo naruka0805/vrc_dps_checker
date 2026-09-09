@@ -25,7 +25,9 @@ VRChatワールド「ECLIPTICA」専用の、ステージ／ボス戦単位でDP
 python ecliptica_overlay.py
 ```
 
-パーティ共有を使う場合は、誰か1人が別途バックエンドを起動しておく（同じLAN内ならそのまま、外部の友達と繋ぐ場合はCloudflare Tunnel等が必要）。
+パーティ共有はデフォルトで公開バックエンドに接続するため、設定は不要。
+
+自分でバックエンドを立てたい場合は`server.py`を起動し、設定画面の「パーティ共有バックエンドのURL」を差し替える。
 
 ```bash
 python server.py
