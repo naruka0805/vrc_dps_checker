@@ -304,7 +304,7 @@ class SettingsDialog(tk.Toplevel):
         self.config_data["taken_pattern"] = self.vars["taken_pattern"].get()
         self.config_data["history_size"] = history_size
         self.config_data["window_opacity_percent"] = window_opacity_percent
-        self.config_data["backend_url"] = self.vars["backend_url"].get().rstrip("/")
+        self.config_data["backend_url"] = self.vars["backend_url"].get().strip().rstrip("/")
         self.config_data["report_interval_seconds"] = report_interval
         self.config_data["party_share_enabled"] = self.party_share_var.get()
         self.config_data["target_warning_sound_enabled"] = self.target_warning_sound_var.get()
@@ -1190,7 +1190,8 @@ class DPSOverlay:
     _last_http_error_log_at = 0.0
 
     def _report_and_fetch(self, dps, total, official_boss_damage, class_name):
-        base_url = self.config.get("backend_url", "").rstrip("/")
+        # コピペでURLの前後に空白が混じることがあるので、スキーム判定の前に落としておく
+        base_url = self.config.get("backend_url", "").strip().rstrip("/")
         # urllibはfile://等も開けてしまうのでhttp(s)以外は使わない
         if not base_url.startswith(("http://", "https://")):
             return
