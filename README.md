@@ -49,10 +49,7 @@ python server.py
 - トークン等の「拾った瞬間」を示すログはECLIPTICA側に存在しないため、取得漏れの検知はできない
 - PARTY共有は、相手も同じアプリを起動してバックエンドに報告していないと数値が出ない（ログから名前だけは分かるが、ダメージ量は分からない）
 
-ログから読み取れる／読み取れない要素の詳細は [LOG_NOTES.md](LOG_NOTES.md) を参照。
-
 ## ファイル構成
 
 - `ecliptica_overlay.py` — クライアント本体（オーバーレイUI・ログ解析）
 - `server.py` — パーティ共有用の最小構成バックエンド（FastAPI）
-- `LOG_NOTES.md` — ECLIPTICAログの解析メモ

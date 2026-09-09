@@ -7,3 +7,5 @@ config.json
 state.json
 app.log
 server.log
+cloudflared.log
+document/
