@@ -629,7 +629,6 @@ class DPSOverlay:
         self.party_members = []
 
         self._warning_wav = None
-        self._last_warning_wav_bytes = None
         if os.path.exists(WARNING_SOUND_WAV_PATH):
             try:
                 self._warning_wav = _load_wav_samples(WARNING_SOUND_WAV_PATH)
@@ -653,13 +652,14 @@ class DPSOverlay:
             wav_bytes = _scale_wav_volume(n_channels, sampwidth, framerate, frames, volume_percent)
         else:
             wav_bytes = _build_warning_beep_wav(volume_percent)
-        # SND_ASYNC + SND_MEMORYは再生完了までバッファを生かしておく必要があるため、
-        # ローカル変数のままにせずselfに保持してGCで解放されるのを防ぐ
-        self._last_warning_wav_bytes = wav_bytes
-        try:
-            winsound.PlaySound(self._last_warning_wav_bytes, winsound.SND_MEMORY | winsound.SND_ASYNC)
-        except RuntimeError:
-            pass
+        # winsoundはSND_MEMORYとSND_ASYNCの併用を許さない（RuntimeErrorになる）。
+        # かといって同期再生をそのまま呼ぶとUIスレッドが音の長さだけ止まるので、
+        # 別スレッドで同期再生する。バッファは引数として渡し、再生中は参照が残る。
+        threading.Thread(
+            target=winsound.PlaySound,
+            args=(wav_bytes, winsound.SND_MEMORY),
+            daemon=True,
+        ).start()
 
     def _warn_log_not_found(self):
         messagebox.showwarning(
