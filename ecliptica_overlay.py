@@ -10,9 +10,12 @@ ECLIPTICAが実際に出す `now in stage` / `now fighting boss` / `now in lobby
 """
 
 import glob
+import io
 import json
+import math
 import os
 import re
+import struct
 import sys
 import threading
 import time
@@ -21,6 +24,8 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import wave
+import winsound
 from collections import deque
 from tkinter import filedialog, messagebox
 
@@ -33,6 +38,7 @@ else:
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 STATE_PATH = os.path.join(SCRIPT_DIR, "state.json")
 APP_LOG_PATH = os.path.join(SCRIPT_DIR, "app.log")
+WARNING_SOUND_WAV_PATH = os.path.join(SCRIPT_DIR, "警告音.wav")
 
 DEFAULT_CONFIG = {
     "log_dir": os.path.join(os.environ["USERPROFILE"], "AppData", "LocalLow", "VRChat", "VRChat"),
@@ -46,7 +52,66 @@ DEFAULT_CONFIG = {
     "party_sort_mode": "no",
     "history_collapsed": False,
     "window_opacity_percent": 90,
+    "target_warning_sound_enabled": False,
+    "target_warning_sound_volume_percent": 80,
 }
+
+
+def _build_warning_beep_wav(volume_percent, freq=880, duration_ms=350, sample_rate=44100):
+    """指定した音量(0〜100)でビープ音のWAVバイト列を生成する。"""
+    volume = max(0.0, min(1.0, volume_percent / 100))
+    amplitude = int(32767 * volume)
+    n_samples = int(sample_rate * duration_ms / 1000)
+    fade_samples = max(1, int(sample_rate * 0.01))  # クリック音防止の10msフェード
+
+    frames = bytearray()
+    for i in range(n_samples):
+        if i < fade_samples:
+            envelope = i / fade_samples
+        elif i > n_samples - fade_samples:
+            envelope = (n_samples - i) / fade_samples
+        else:
+            envelope = 1.0
+        value = int(amplitude * envelope * math.sin(2 * math.pi * freq * i / sample_rate))
+        frames += struct.pack("<h", value)
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(bytes(frames))
+    return buf.getvalue()
+
+
+def _load_wav_samples(path):
+    """WAVファイルを読み込み、(チャンネル数, サンプル幅, サンプルレート, フレームデータ)を返す。"""
+    with wave.open(path, "rb") as wf:
+        n_channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        framerate = wf.getframerate()
+        frames = wf.readframes(wf.getnframes())
+    return n_channels, sampwidth, framerate, frames
+
+
+def _scale_wav_volume(n_channels, sampwidth, framerate, frames, volume_percent):
+    """16bit PCMのWAVフレームを指定音量(0〜100)にスケールしたWAVバイト列を返す。"""
+    volume = max(0.0, min(1.0, volume_percent / 100))
+    if sampwidth == 2:
+        count = len(frames) // 2
+        samples = struct.unpack(f"<{count}h", frames)
+        scaled_frames = struct.pack(f"<{count}h", *(int(s * volume) for s in samples))
+    else:
+        # 16bit以外はそのまま（音量調整なし）で再生する
+        scaled_frames = frames
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(n_channels)
+        wf.setsampwidth(sampwidth)
+        wf.setframerate(framerate)
+        wf.writeframes(scaled_frames)
+    return buf.getvalue()
 
 # (内部キー, ドロップダウンに出す表示名)
 PARTY_SORT_MODES = [
@@ -190,6 +255,26 @@ class SettingsDialog(tk.Toplevel):
         ).grid(row=row, column=0, columnspan=2, sticky="w", padx=6, pady=(8, 4))
         row += 1
 
+        self.target_warning_sound_var = tk.BooleanVar(value=bool(config["target_warning_sound_enabled"]))
+        tk.Checkbutton(
+            self, text="ボスに狙われたら警告音を鳴らす",
+            variable=self.target_warning_sound_var,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
+        row += 1
+
+        tk.Label(self, text="警告音の音量（0〜100）").grid(
+            row=row, column=0, sticky="w", padx=6, pady=(0, 2), columnspan=2
+        )
+        row += 1
+        self.target_warning_sound_volume_var = tk.IntVar(
+            value=int(config["target_warning_sound_volume_percent"])
+        )
+        tk.Scale(
+            self, from_=0, to=100, orient="horizontal",
+            variable=self.target_warning_sound_volume_var, length=280,
+        ).grid(row=row, column=0, padx=6, columnspan=2, sticky="w")
+        row += 1
+
         tk.Button(self, text="保存", command=self._save).grid(row=row, column=0, pady=10, padx=6, sticky="w")
         tk.Button(self, text="キャンセル", command=self.destroy).grid(row=row, column=1, pady=10, padx=6)
 
@@ -222,6 +307,8 @@ class SettingsDialog(tk.Toplevel):
         self.config_data["backend_url"] = self.vars["backend_url"].get().rstrip("/")
         self.config_data["report_interval_seconds"] = report_interval
         self.config_data["party_share_enabled"] = self.party_share_var.get()
+        self.config_data["target_warning_sound_enabled"] = self.target_warning_sound_var.get()
+        self.config_data["target_warning_sound_volume_percent"] = self.target_warning_sound_volume_var.get()
         save_config(self.config_data)
         self.on_save(self.config_data)
         self.destroy()
@@ -505,6 +592,14 @@ class DPSOverlay:
         self._pending_strike_dmg = None
         self.party_members = []
 
+        self._warning_wav = None
+        self._last_warning_wav_bytes = None
+        if os.path.exists(WARNING_SOUND_WAV_PATH):
+            try:
+                self._warning_wav = _load_wav_samples(WARNING_SOUND_WAV_PATH)
+            except (wave.Error, EOFError):
+                pass
+
         self._switch_log_if_needed()
         self._restore_state_if_matching()
         if self.log_file is None:
@@ -514,6 +609,21 @@ class DPSOverlay:
 
         self._network_thread = threading.Thread(target=self._network_worker, daemon=True)
         self._network_thread.start()
+
+    def _play_target_warning_sound(self):
+        volume_percent = self.config.get("target_warning_sound_volume_percent", 80)
+        if self._warning_wav is not None:
+            n_channels, sampwidth, framerate, frames = self._warning_wav
+            wav_bytes = _scale_wav_volume(n_channels, sampwidth, framerate, frames, volume_percent)
+        else:
+            wav_bytes = _build_warning_beep_wav(volume_percent)
+        # SND_ASYNC + SND_MEMORYは再生完了までバッファを生かしておく必要があるため、
+        # ローカル変数のままにせずselfに保持してGCで解放されるのを防ぐ
+        self._last_warning_wav_bytes = wav_bytes
+        try:
+            winsound.PlaySound(self._last_warning_wav_bytes, winsound.SND_MEMORY | winsound.SND_ASYNC)
+        except RuntimeError:
+            pass
 
     def _warn_log_not_found(self):
         messagebox.showwarning(
@@ -735,7 +845,11 @@ class DPSOverlay:
             enemy_name, new_owner = m.group(1).strip(), m.group(2).strip()
             # 雑魚は無視し、現在のステージのボスに対する所有権移動だけを見る
             if self.current_stage and enemy_name == self.current_stage.boss_name:
+                was_targeted = self.current_boss_target == self.player_name
                 self.current_boss_target = new_owner
+                is_targeted = self.current_boss_target == self.player_name
+                if is_targeted and not was_targeted and self.config.get("target_warning_sound_enabled"):
+                    self._play_target_warning_sound()
             return
         m = SESSION_ID_RE.search(line)
         if m:
