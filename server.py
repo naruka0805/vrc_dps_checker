@@ -114,6 +114,25 @@ def _sweep_locked(now: float) -> None:
         del _rate_buckets[ip]
 
 
+def _members_snapshot_locked(instance_id: str, now: float) -> list[dict]:
+    """期限切れを除いたメンバー一覧を参加順で返す（要 _lock 保持）。"""
+    room = rooms.get(instance_id, {})
+    active = {name: data for name, data in room.items() if now - data["last_seen"] <= STALE_SECONDS}
+    if active:
+        rooms[instance_id] = active
+    else:
+        rooms.pop(instance_id, None)
+
+    members = sorted(
+        ({"player_name": name, **data} for name, data in active.items()),
+        key=lambda m: m["first_seen"],
+    )
+    for m in members:
+        del m["last_seen"]
+        del m["first_seen"]
+    return members
+
+
 def rate_limit(request: Request) -> None:
     client_ip = request.client.host if request.client else "unknown"
     now = time.time()
@@ -174,6 +193,8 @@ def report(r: Report):
             "last_seen": now,
             "first_seen": first_seen,
         }
+        # クライアントは報告と取得を毎周期セットで行うので、ここで一覧も返して往復を1回で済ませる
+        members = _members_snapshot_locked(r.instance_id, now)
 
     # 利用状況の集計用。毎リクエストではなく参加した瞬間だけ記録する
     # (Cloud Runは標準出力のJSONを構造化ログとして取り込む)
@@ -185,7 +206,7 @@ def report(r: Report):
             "player_name": r.player_name,
             "class_name": r.class_name,
         }, ensure_ascii=False), flush=True)
-    return {"ok": True}
+    return {"ok": True, "members": members}
 
 
 @app.get("/room/{instance_id}", dependencies=[Depends(rate_limit)])
@@ -193,21 +214,7 @@ def get_room(instance_id: str = Path(min_length=1, max_length=MAX_INSTANCE_ID_LE
     now = time.time()
     with _lock:
         _sweep_locked(now)
-
-        room = rooms.get(instance_id, {})
-        active = {name: data for name, data in room.items() if now - data["last_seen"] <= STALE_SECONDS}
-        if active:
-            rooms[instance_id] = active
-        else:
-            rooms.pop(instance_id, None)
-
-        members = sorted(
-            ({"player_name": name, **data} for name, data in active.items()),
-            key=lambda m: m["first_seen"],
-        )
-    for m in members:
-        del m["last_seen"]
-        del m["first_seen"]
+        members = _members_snapshot_locked(instance_id, now)
     return {"members": members}
 
 

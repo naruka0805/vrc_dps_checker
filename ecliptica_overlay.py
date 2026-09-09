@@ -1210,16 +1210,20 @@ class DPSOverlay:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
+            # 報告の応答に一覧が入っているので、取得のための追加リクエストは要らない。
             # ゼロスケール構成だと初回がコールドスタート待ちになるので長めに取る
-            urllib.request.urlopen(req, timeout=10).close()
-
-            req = urllib.request.Request(
-                f"{base_url}/room/{urllib.parse.quote(self.instance_id, safe='')}"
-            )
             with urllib.request.urlopen(req, timeout=10) as resp:
                 # 際限なく読むと巨大な応答でメモリを食い潰される
-                body = resp.read(MAX_PARTY_RESPONSE_BYTES)
-            data = json.loads(body.decode("utf-8"))
+                data = json.loads(resp.read(MAX_PARTY_RESPONSE_BYTES).decode("utf-8"))
+
+            if not isinstance(data, dict) or "members" not in data:
+                # 一覧を返さないバックエンド(自前で立てた古いserver.py等)では個別に取得する
+                req = urllib.request.Request(
+                    f"{base_url}/room/{urllib.parse.quote(self.instance_id, safe='')}"
+                )
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read(MAX_PARTY_RESPONSE_BYTES).decode("utf-8"))
+
             self.party_members = _sanitize_party_members(
                 data.get("members") if isinstance(data, dict) else None
             )
