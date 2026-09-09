@@ -415,6 +415,42 @@ class StageSegment:
         return stage
 
 
+MAX_PARTY_RESPONSE_BYTES = 64 * 1024
+MAX_PARTY_MEMBERS = 40
+
+
+def _coerce_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return value if math.isfinite(value) else 0
+
+
+def _sanitize_party_members(raw):
+    """バックエンドの応答を信用せず、UIに渡す前に型と件数を正規化する。
+
+    描画は_update_displayの中で行われ、そこで例外が漏れると次回のroot.afterに
+    到達せずオーバーレイ全体が永久に止まる。壊れた要素は捨てて描画を守る。
+    """
+    if not isinstance(raw, list):
+        return []
+    members = []
+    for item in raw[:MAX_PARTY_MEMBERS]:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("player_name")
+        if not isinstance(name, str) or not name:
+            continue
+        class_name = item.get("class_name")
+        members.append({
+            "player_name": name[:64],
+            "dps": _coerce_number(item.get("dps")),
+            "total_damage": _coerce_number(item.get("total_damage")),
+            "official_boss_damage": _coerce_number(item.get("official_boss_damage")),
+            "class_name": class_name if isinstance(class_name, str) else "",
+        })
+    return members
+
+
 class DPSOverlay:
     def __init__(self):
         self.config = load_config()
@@ -1028,9 +1064,12 @@ class DPSOverlay:
             self.dps_label.config(text="0")
             self._set_stats(0, 0, 0, 0, 0)
 
-        self._refresh_party_display()
-        self._fit_window_to_content()
-        self.root.after(UPDATE_MS, self._update_display)
+        try:
+            self._refresh_party_display()
+            self._fit_window_to_content()
+        finally:
+            # 再スケジュールに到達しないとオーバーレイ全体が二度と更新されない
+            self.root.after(UPDATE_MS, self._update_display)
 
     def _fit_window_to_content(self):
         """内容量に合わせて幅・高さを自動調整する（位置は保つ）。"""
@@ -1148,9 +1187,12 @@ class DPSOverlay:
         except OSError:
             pass
 
+    _last_http_error_log_at = 0.0
+
     def _report_and_fetch(self, dps, total, official_boss_damage, class_name):
         base_url = self.config.get("backend_url", "").rstrip("/")
-        if not base_url:
+        # urllibはfile://等も開けてしまうのでhttp(s)以外は使わない
+        if not base_url.startswith(("http://", "https://")):
             return
         payload = {
             "instance_id": self.instance_id,
@@ -1167,12 +1209,26 @@ class DPSOverlay:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            urllib.request.urlopen(req, timeout=5).close()
+            # ゼロスケール構成だと初回がコールドスタート待ちになるので長めに取る
+            urllib.request.urlopen(req, timeout=10).close()
 
-            req = urllib.request.Request(f"{base_url}/room/{urllib.parse.quote(self.instance_id, safe='')}")
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            self.party_members = data.get("members", [])
+            req = urllib.request.Request(
+                f"{base_url}/room/{urllib.parse.quote(self.instance_id, safe='')}"
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                # 際限なく読むと巨大な応答でメモリを食い潰される
+                body = resp.read(MAX_PARTY_RESPONSE_BYTES)
+            data = json.loads(body.decode("utf-8"))
+            self.party_members = _sanitize_party_members(
+                data.get("members") if isinstance(data, dict) else None
+            )
+        except urllib.error.HTTPError as exc:
+            # HTTPErrorはURLErrorのサブクラスなので、下のexceptに任せると429/503が無言で消える。
+            # 毎周回書くとログが膨れるので間隔を空ける。
+            now = time.time()
+            if now - self._last_http_error_log_at > 60:
+                self._last_http_error_log_at = now
+                self._log_network_error(f"backend returned HTTP {exc.code} {exc.reason}")
         except (urllib.error.URLError, OSError, ValueError):
             # バックエンドに繋がらない場合は静かに諦めて次の間隔で再試行する
             pass
