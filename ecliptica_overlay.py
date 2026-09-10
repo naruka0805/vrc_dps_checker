@@ -430,12 +430,6 @@ class StageSegment:
         return bool(self.token_total) and self.tokens_collected_now < self.token_total
 
     @property
-    def token_text(self):
-        if not self.token_total:
-            return ""
-        return f"{self.tokens_collected_now}/{self.token_total}"
-
-    @property
     def display_name(self):
         return self.name[len("Stage_"):] if self.name.startswith("Stage_") else self.name
 
@@ -1082,12 +1076,11 @@ class DPSOverlay:
     def _describe_stage_status(self, stage, now):
         if stage.is_hub:
             return f"休憩所  {format_duration(stage.duration(now))}"
-        token = f"  🔷{stage.token_text}" if stage.token_text else ""
         if stage.boss_name and not stage.boss_defeated:
-            return f"ボス戦: {stage.boss_name}  {format_duration(stage.duration(now))}{token}"
+            return f"ボス戦: {stage.boss_name}  {format_duration(stage.duration(now))}"
         if stage.boss_defeated:
-            return f"ボス撃破  {format_duration(stage.duration(now))}{token}"
-        return f"探索中  {format_duration(stage.duration(now))}{token}"
+            return f"ボス撃破  {format_duration(stage.duration(now))}"
+        return f"探索中  {format_duration(stage.duration(now))}"
 
     HISTORY_COL_WIDTHS = {"rank": 3, "name": 12, "duration": 6, "dps": 8, "damage": 14}
     HISTORY_COL_ANCHOR = {"damage": "e", "dps": "e"}
