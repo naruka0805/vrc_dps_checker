@@ -133,6 +133,10 @@ PARTY_SORT_LABEL_BY_KEY = {key: label for key, label in PARTY_SORT_MODES}
 # 依存する内部処理なので、ワールドごとに変わるdamage_pattern等とは違い
 # 設定画面には出さずここに固定しておく。
 INSTANCE_RE = re.compile(r"Joining (wrld_[\w-]+:\S+)")
+# ワールドを出ると必ず出る。VRChatを終了した場合はこの後 Joining が来ない
+LEFT_ROOM_RE = re.compile(r"OnLeftRoom")
+# VRChatが落ちた等でログ自体が止まった場合の保険。この秒数だけ無音なら送信をやめる
+LOG_IDLE_TIMEOUT_SECONDS = 300
 LOCAL_PLAYER_RE = re.compile(r'Initialized PlayerAPI "(.+?)" is local')
 STAGE_RE = re.compile(r"ECLIPTICA - now in stage: (.+?) on phase: ([\d.]+) as class: (\S+)")
 BOSS_RE = re.compile(r"ECLIPTICA - now fighting boss: (.+?)\(Clone\) on phase: [\d.]+")
@@ -708,6 +712,7 @@ class DPSOverlay:
         self.current_boss_target = None  # 現在ボスのownershipを持っている（＝狙われている）プレイヤー名
         self._pending_strike_dmg = None
         self._pending_token_spawns = 0  # 次のステージに湧いたトークン数の受け皿
+        self._last_log_line_at = time.time()  # ログが流れなくなったことを検知するため
         self.party_members = []
 
         self._warning_wav = self._load_optional_wav(WARNING_SOUND_WAV_PATH)
@@ -903,6 +908,7 @@ class DPSOverlay:
         self._switch_log_if_needed()
         if self.log_file:
             for line in self.log_file:
+                self._last_log_line_at = time.time()
                 self._handle_line(line)
         self.root.after(POLL_MS, self._poll_log)
 
@@ -978,6 +984,12 @@ class DPSOverlay:
                 self.current_stage.finalize_tokens("intermission")
             self._end_current_stage(now)
             self.current_boss_target = None
+            return
+        if LEFT_ROOM_RE.search(line):
+            # ワールドを出た後も送り続けると、仲間のパーティ欄に居座ってしまう。
+            # 別のワールドへ移った場合は直後のJoiningで入り直す。
+            self.instance_id = None
+            self.party_members = []
             return
         m = INSTANCE_RE.search(line)
         if m:
@@ -1057,7 +1069,7 @@ class DPSOverlay:
     def _describe_stage_status(self, stage, now):
         if stage.is_hub:
             return f"休憩所  {format_duration(stage.duration(now))}"
-        token = f"  🪙{stage.token_text}" if stage.token_text else ""
+        token = f"  🔷{stage.token_text}" if stage.token_text else ""
         if stage.boss_name and not stage.boss_defeated:
             return f"ボス戦: {stage.boss_name}  {format_duration(stage.duration(now))}{token}"
         if stage.boss_defeated:
@@ -1302,6 +1314,8 @@ class DPSOverlay:
                     self.config.get("party_share_enabled")
                     and self.instance_id
                     and self.player_name
+                    # ログが止まっている＝VRChatが動いていないので送らない
+                    and time.time() - self._last_log_line_at < LOG_IDLE_TIMEOUT_SECONDS
                 ):
                     dps, total, official_boss_damage = self._current_dps_snapshot()
                     class_name = self._current_class_name()
