@@ -335,6 +335,9 @@ class SettingsDialog(tk.Toplevel):
 
 
 DPS_WINDOW_SECONDS = 10  # DPS/DTPSは「戦闘全体の平均」ではなく直近この秒数の実測値にする
+# 攻撃し始めの数フレームは経過時間がほぼ0で、1発50でも800dps等の跳ね上がりになる。
+# 分母に下限を設けて、少ない標本から過大な数値が出ないようにする。
+MIN_DPS_SPAN_SECONDS = 1.0
 
 
 class StageSegment:
@@ -429,8 +432,8 @@ class StageSegment:
         if not self.recent_hits:
             return 0.0
         total = sum(amount for _, amount in self.recent_hits)
-        span = max(now - self.recent_hits[0][0], 1e-6)
-        return total / min(DPS_WINDOW_SECONDS, span)
+        span = now - self.recent_hits[0][0]
+        return total / min(DPS_WINDOW_SECONDS, max(span, MIN_DPS_SPAN_SECONDS))
 
     def dtps(self, at_time=None):
         now = at_time if at_time is not None else self.last_event_time
@@ -439,8 +442,8 @@ class StageSegment:
         if not self.recent_taken:
             return 0.0
         total = sum(amount for _, amount in self.recent_taken)
-        span = max(now - self.recent_taken[0][0], 1e-6)
-        return total / min(DPS_WINDOW_SECONDS, span)
+        span = now - self.recent_taken[0][0]
+        return total / min(DPS_WINDOW_SECONDS, max(span, MIN_DPS_SPAN_SECONDS))
 
     def avg_hit(self):
         return self.damage_total / self.hit_count if self.hit_count else 0.0
