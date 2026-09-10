@@ -91,6 +91,42 @@ _last_sweep = 0.0
 _rate_buckets: dict[str, tuple[float, int]] = {}
 
 
+# ロックを持ったまま標準出力へ書くと、書き込みが詰まった時に全リクエストが止まる。
+# ロック内では溜めるだけにして、解放後にまとめて出す。
+_pending_events: list[str] = []
+
+
+def _queue_event_locked(event: str, instance_id: str, player_name: str, **extra) -> None:
+    _pending_events.append(json.dumps({
+        "severity": "INFO",
+        "event": event,
+        "instance_id": instance_id,
+        "player_name": player_name,
+        **extra,
+    }, ensure_ascii=False))
+
+
+def _flush_events() -> None:
+    """溜めたイベントを出力する。ロックを持っていない状態で呼ぶこと。"""
+    if not _pending_events:
+        return
+    with _lock:
+        events, _pending_events[:] = list(_pending_events), []
+    for line in events:
+        print(line, flush=True)
+
+
+def _drop_stale_locked(instance_id: str, room: dict, now: float) -> None:
+    """期限切れのメンバーを取り除き、退出として記録する（要 _lock 保持）。"""
+    for name in [n for n, d in room.items() if now - d["last_seen"] > STALE_SECONDS]:
+        data = room.pop(name)
+        _queue_event_locked(
+            "player_left", instance_id, name,
+            class_name=data["class_name"],
+            stayed_seconds=round(data["last_seen"] - data["first_seen"], 1),
+        )
+
+
 def _sweep_locked(now: float) -> None:
     """期限切れメンバー・空room・古いレート制限を捨てる（要_lock保持）。
 
@@ -103,8 +139,7 @@ def _sweep_locked(now: float) -> None:
 
     for instance_id in list(rooms):
         room = rooms[instance_id]
-        for name in [n for n, d in room.items() if now - d["last_seen"] > STALE_SECONDS]:
-            del room[name]
+        _drop_stale_locked(instance_id, room, now)
         if not room:
             del rooms[instance_id]
 
@@ -116,15 +151,15 @@ def _sweep_locked(now: float) -> None:
 
 def _members_snapshot_locked(instance_id: str, now: float) -> list[dict]:
     """期限切れを除いたメンバー一覧を参加順で返す（要 _lock 保持）。"""
-    room = rooms.get(instance_id, {})
-    active = {name: data for name, data in room.items() if now - data["last_seen"] <= STALE_SECONDS}
-    if active:
-        rooms[instance_id] = active
-    else:
+    room = rooms.get(instance_id)
+    if room is None:
+        return []
+    _drop_stale_locked(instance_id, room, now)
+    if not room:
         rooms.pop(instance_id, None)
 
     members = sorted(
-        ({"player_name": name, **data} for name, data in active.items()),
+        ({"player_name": name, **data} for name, data in room.items()),
         key=lambda m: m["first_seen"],
     )
     for m in members:
@@ -149,6 +184,7 @@ def rate_limit(request: Request) -> None:
         count += 1
         _rate_buckets[client_ip] = (start, count)
 
+    _flush_events()
     if count > RATE_LIMIT_MAX_REQUESTS:
         raise HTTPException(status_code=429, detail="too many requests")
 
@@ -193,19 +229,14 @@ def report(r: Report):
             "last_seen": now,
             "first_seen": first_seen,
         }
+        # 利用状況の集計用。毎リクエストではなく参加した瞬間だけ記録する
+        if joined:
+            _queue_event_locked("player_joined", r.instance_id, r.player_name,
+                                class_name=r.class_name)
         # クライアントは報告と取得を毎周期セットで行うので、ここで一覧も返して往復を1回で済ませる
         members = _members_snapshot_locked(r.instance_id, now)
 
-    # 利用状況の集計用。毎リクエストではなく参加した瞬間だけ記録する
-    # (Cloud Runは標準出力のJSONを構造化ログとして取り込む)
-    if joined:
-        print(json.dumps({
-            "severity": "INFO",
-            "event": "player_joined",
-            "instance_id": r.instance_id,
-            "player_name": r.player_name,
-            "class_name": r.class_name,
-        }, ensure_ascii=False), flush=True)
+    _flush_events()
     return {"ok": True, "members": members}
 
 
@@ -215,6 +246,7 @@ def get_room(instance_id: str = Path(min_length=1, max_length=MAX_INSTANCE_ID_LE
     with _lock:
         _sweep_locked(now)
         members = _members_snapshot_locked(instance_id, now)
+    _flush_events()
     return {"members": members}
 
 
