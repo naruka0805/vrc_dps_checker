@@ -170,6 +170,8 @@ CLASS_INFO = {
     "Nekomancer": ("NM", "#ab47bc", "support"),
 }
 
+# 送受信間隔の下限。これより短くすると人数分のリクエストがレート制限に届く
+MIN_REPORT_INTERVAL_SECONDS = 1.0
 POLL_MS = 300  # ログファイルを読みに行く間隔
 UPDATE_MS = 200  # 表示を更新する間隔
 # ボス撃破の演出と重ならないよう少し遅らせる。撃破ログはロビーでも再送されるため、
@@ -237,7 +239,7 @@ class SettingsDialog(tk.Toplevel):
             ("taken_pattern", "被ダメージ行の正規表現（1つ目の括弧=ダメージ量）", False),
             ("history_size", "履歴に残すステージ数", False),
             ("backend_url", "パーティ共有バックエンドのURL", False),
-            ("report_interval_seconds", "パーティ共有の送受信間隔（秒）", False),
+            ("report_interval_seconds", "パーティ表示の更新間隔（1秒以上）", False),
         ]
         self.vars = {}
         row = 0
@@ -265,21 +267,21 @@ class SettingsDialog(tk.Toplevel):
 
         self.party_share_var = tk.BooleanVar(value=bool(config["party_share_enabled"]))
         tk.Checkbutton(
-            self, text="パーティ共有を有効化（同じVRChatインスタンスの仲間とDPSを共有）",
+            self, text="パーティ共有を有効化（仲間とDPSを共有）",
             variable=self.party_share_var,
         ).grid(row=row, column=0, columnspan=2, sticky="w", padx=6, pady=(8, 4))
         row += 1
 
         self.target_warning_sound_var = tk.BooleanVar(value=bool(config["target_warning_sound_enabled"]))
         tk.Checkbutton(
-            self, text="ボスに狙われたら警告音を鳴らす",
+            self, text="ボスに狙われたら警告音",
             variable=self.target_warning_sound_var,
         ).grid(row=row, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
         row += 1
 
         self.token_warning_var = tk.BooleanVar(value=bool(config["token_warning_enabled"]))
         tk.Checkbutton(
-            self, text="トークンを取り逃したままボス戦に入ったら警告音を鳴らす",
+            self, text="トークン未回収なら警告音",
             variable=self.token_warning_var,
         ).grid(row=row, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 4))
         row += 1
@@ -315,7 +317,14 @@ class SettingsDialog(tk.Toplevel):
             messagebox.showerror("設定エラー", f"正規表現が不正です:\n{exc}")
             return
         except ValueError:
-            messagebox.showerror("設定エラー", "履歴数・送受信間隔は数値で入力してください")
+            messagebox.showerror("設定エラー", "履歴数・更新間隔は数値で入力してください")
+            return
+
+        if report_interval < MIN_REPORT_INTERVAL_SECONDS:
+            messagebox.showerror(
+                "設定エラー",
+                f"パーティ表示の更新間隔は{MIN_REPORT_INTERVAL_SECONDS:.0f}秒以上にしてください",
+            )
             return
 
         window_opacity_percent = self.opacity_var.get()
@@ -1289,7 +1298,6 @@ class DPSOverlay:
     def _network_worker(self):
         while True:
             try:
-                interval = self.config.get("report_interval_seconds", 3)
                 if (
                     self.config.get("party_share_enabled")
                     and self.instance_id
@@ -1305,7 +1313,9 @@ class DPSOverlay:
                 # 静かに死んでパーティ共有だけ二度と復帰しなくなる（exeは--noconsoleなので
                 # エラーにも気づけない）。何が起きたかは後で追えるようログにだけ残す。
                 self._log_network_error(traceback.format_exc())
-            time.sleep(max(1.0, self.config.get("report_interval_seconds", 3)))
+            # 設定変更に追随できるよう、待つ直前に読み直す
+            time.sleep(max(MIN_REPORT_INTERVAL_SECONDS,
+                           self.config.get("report_interval_seconds", 3)))
 
     def _log_network_error(self, message):
         try:
