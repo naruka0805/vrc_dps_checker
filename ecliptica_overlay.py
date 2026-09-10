@@ -405,12 +405,18 @@ class StageSegment:
 
     @property
     def tokens_collected_now(self):
-        """今の時点で拾えている数。ボス戦中の分も含む。"""
+        """今の時点で拾えている数。ボス戦中の分も含む。
+
+        ボス突入時と休憩突入時にも取得と無関係な保存が走る。確定処理でそれらを
+        差し引くまでの数秒間は多めに数えてしまうので、総数を超えては数えない。
+        """
         if self.token_collected is None:
-            return self.token_saves
-        if self.token_finalized:
-            return self.token_collected
-        return self.token_collected + self.token_boss_saves
+            got = self.token_saves
+        elif self.token_finalized:
+            got = self.token_collected
+        else:
+            got = self.token_collected + self.token_boss_saves
+        return min(got, self.token_total) if self.token_total else got
 
     @property
     def tokens_missing(self):
