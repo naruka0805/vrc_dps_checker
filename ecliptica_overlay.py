@@ -172,7 +172,10 @@ CLASS_INFO = {
 
 POLL_MS = 300  # ログファイルを読みに行く間隔
 UPDATE_MS = 200  # 表示を更新する間隔
-TOKEN_WARNING_DELAY_MS = 1000  # ボス撃破の演出と重ならないよう、警告を少し遅らせる
+# ボス撃破の演出と重ならないよう少し遅らせる。撃破ログはロビーでも再送されるため、
+# この間にステージが終わっていないかを見て誤発火を防ぐ用途も兼ねる。
+# ログ読み取りは POLL_MS ごとなので、その1回分より長くしておく必要がある。
+TOKEN_WARNING_DELAY_MS = 500
 
 
 def load_config():
@@ -1034,6 +1037,10 @@ class DPSOverlay:
         self.root.after(TOKEN_WARNING_DELAY_MS, lambda: self._warn_if_tokens_missing(stage))
 
     def _warn_if_tokens_missing(self, stage):
+        # 撃破ログはロビーで延々と再送されるため、全滅やラン終了でも一度は発火する。
+        # 遅らせている間にステージが終わっていたら、もう拾えないので鳴らさない。
+        if self.current_stage is not stage:
+            return
         # 遅らせている間に拾っているかもしれないので、鳴らす直前に数え直す
         if stage.tokens_missing:
             self._play_warning_sound(self._token_wav, TOKEN_BEEP_HZ)
@@ -1045,13 +1052,10 @@ class DPSOverlay:
         if stage.boss_name and not stage.boss_defeated:
             return f"ボス戦: {stage.boss_name}  {format_duration(stage.duration(now))}{token}"
         if stage.boss_defeated:
-            # 撃破後はゲートへ移動するまでが回収の猶予。取り逃しをここで目立たせる
-            if stage.tokens_missing:
-                return f"⚠ トークン未回収 {stage.token_text}  ゲートへ行く前に回収"
             return f"ボス撃破  {format_duration(stage.duration(now))}{token}"
         return f"探索中  {format_duration(stage.duration(now))}{token}"
 
-    HISTORY_COL_WIDTHS = {"rank": 3, "name": 12, "duration": 6, "token": 5, "dps": 8, "damage": 14}
+    HISTORY_COL_WIDTHS = {"rank": 3, "name": 12, "duration": 6, "dps": 8, "damage": 14}
     HISTORY_COL_ANCHOR = {"damage": "e", "dps": "e"}
     PARTY_COL_WIDTHS = {"rank": 3, "name": 11, "class": 5, "dps": 7, "total": 16}
     PARTY_COL_ANCHOR = {"dps": "e", "total": "e"}
@@ -1134,10 +1138,6 @@ class DPSOverlay:
             if stage.official_boss_damage:
                 damage_text += f"({stage.official_boss_damage})"
             row["damage"].config(text=damage_text, fg=color)
-            token_color = color
-            if stage.token_total and (stage.token_collected or 0) < stage.token_total:
-                token_color = "#ff6b6b"  # 取り逃したステージは赤で目立たせる
-            row["token"].config(text=stage.token_text, fg=token_color)
             row["dps"].config(text=f"{stage.final_dps():.0f}dps", fg=color)
             for w in row.values():
                 w.grid()
@@ -1151,8 +1151,14 @@ class DPSOverlay:
 
     def _update_display(self):
         now = time.time()
+        stage = self.current_stage
 
-        if self.current_boss_target:
+        # 撃破後はゲートへ移動するまでが回収の猶予。狙われた表示より優先して出す
+        if stage is not None and stage.boss_defeated and stage.tokens_missing:
+            self.target_alert_label.config(
+                text="⚠ トークン未回収あり", fg="#ff6b6b", bg="#14141a",
+            )
+        elif self.current_boss_target:
             is_self = self.current_boss_target == self.player_name
             color = "#ff6b6b" if is_self else "#8a8a99"
             self.target_alert_label.config(
@@ -1161,7 +1167,6 @@ class DPSOverlay:
         else:
             self.target_alert_label.config(text="", fg="#14141a", bg="#14141a")
 
-        stage = self.current_stage
         if stage is not None:
             self.stage_name_label.config(text=f"{stage.display_name}  {stage.phase * 100:.0f}%")
             self.status_label.config(text=self._describe_stage_status(stage, now), fg="#8a8a99")
