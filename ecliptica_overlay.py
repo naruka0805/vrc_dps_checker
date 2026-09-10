@@ -29,6 +29,8 @@ import winsound
 from collections import deque
 from tkinter import filedialog, messagebox
 
+VERSION = "1.2.0"
+
 if getattr(sys, "frozen", False):
     # PyInstallerでexe化した場合、__file__は一時展開フォルダを指すため、
     # 代わりにexe自体の場所を設定ファイルの保存先にする。
@@ -305,6 +307,11 @@ class SettingsDialog(tk.Toplevel):
 
         tk.Button(self, text="保存", command=self._save).grid(row=row, column=0, pady=10, padx=6, sticky="w")
         tk.Button(self, text="キャンセル", command=self.destroy).grid(row=row, column=1, pady=10, padx=6)
+        row += 1
+
+        tk.Label(self, text=f"EclipticaOverlay v{VERSION}", fg="#8a8a99").grid(
+            row=row, column=0, columnspan=2, sticky="e", padx=6, pady=(0, 6)
+        )
 
     def _browse_dir(self, var):
         chosen = filedialog.askdirectory(initialdir=var.get())
