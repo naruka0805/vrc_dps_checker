@@ -145,6 +145,8 @@ BOSS_RE = re.compile(r"ECLIPTICA - now fighting boss: (.+?)\(Clone\) on phase: [
 BOSS_DEFEATED_RE = re.compile(r"Tracking boss as defeated in-run\.")
 LOBBY_RE = re.compile(r"ECLIPTICA - now in lobby")
 INTERMISSION_RE = re.compile(r"ECLIPTICA - now in intermission")
+# 今いるインスタンスがEclipticaかの判定に使う。ワールドが出す行を広く拾う
+ECLIPTICA_LINE_RE = re.compile(r"ECLIPTICA (?:- now|saving|loaded|Loading|MASTER|session)")
 SESSION_ID_RE = re.compile(r"ECLIPTICA (?:MASTER Setting|saving|loaded) SESSION ID(?: to)? (\d+)")
 
 # トークンはステージ移行の直前に湧いた数だけ行が出る（通常3行）。
@@ -716,6 +718,8 @@ class DPSOverlay:
         self.player_name = None
         self.session_id = None
         self.in_lobby = False
+        # Ecliptica以外のワールドでは送らない。Joiningで falseに戻す
+        self.in_ecliptica = False
         self.current_boss_target = None  # 現在ボスのownershipを持っている（＝狙われている）プレイヤー名
         self._pending_strike_dmg = None
         self._pending_token_spawns = 0  # 次のステージに湧いたトークン数の受け皿
@@ -851,9 +855,16 @@ class DPSOverlay:
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
+                    if ECLIPTICA_LINE_RE.search(line):
+                        self.in_ecliptica = True
+                    if LEFT_ROOM_RE.search(line):
+                        self.instance_id = None
+                        self.in_ecliptica = False
+                        continue
                     m = INSTANCE_RE.search(line)
                     if m:
                         self.instance_id = m.group(1)
+                        self.in_ecliptica = False
                         continue
                     m = LOCAL_PLAYER_RE.search(line)
                     if m:
@@ -935,6 +946,9 @@ class DPSOverlay:
             if self.current_stage and not self.current_stage.boss_defeated:
                 self.current_stage.add_taken(amount, now)
             return
+        if ECLIPTICA_LINE_RE.search(line):
+            # このインスタンスはEcliptica。ワールドを出るまで送信を許可する
+            self.in_ecliptica = True
         if TOKEN_SPAWN_RE.search(line):
             # ステージ移行の直前に出るので、次のステージの持ち分として貯めておく
             self._pending_token_spawns += 1
@@ -996,11 +1010,14 @@ class DPSOverlay:
             # ワールドを出た後も送り続けると、仲間のパーティ欄に居座ってしまう。
             # 別のワールドへ移った場合は直後のJoiningで入り直す。
             self.instance_id = None
+            self.in_ecliptica = False
             self.party_members = []
             return
         m = INSTANCE_RE.search(line)
         if m:
             self.instance_id = m.group(1)
+            # 別のワールドかもしれないので、ECLIPTICAの行を見るまでは送らない
+            self.in_ecliptica = False
             return
         m = LOCAL_PLAYER_RE.search(line)
         if m:
@@ -1319,6 +1336,8 @@ class DPSOverlay:
                 if (
                     self.config.get("party_share_enabled")
                     and self.instance_id
+                    # 他のワールドに居る間まで送ると、無駄な通信と集計汚れになる
+                    and self.in_ecliptica
                     and self.player_name
                     # ログが止まっている＝VRChatが動いていないので送らない
                     and time.time() - self._last_log_line_at < LOG_IDLE_TIMEOUT_SECONDS
