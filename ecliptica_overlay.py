@@ -29,7 +29,7 @@ import winsound
 from collections import deque
 from tkinter import filedialog, messagebox
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 if getattr(sys, "frozen", False):
     # PyInstallerでexe化した場合、__file__は一時展開フォルダを指すため、
